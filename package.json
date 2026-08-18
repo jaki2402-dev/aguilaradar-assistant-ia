@@ -1,0 +1,6 @@
+{
+  "name": "aguilaradar-assistant-ia",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Relais IA gratuit (Cloudflare Workers AI) pour l'Assistant du site AguilaRadar."
+}
