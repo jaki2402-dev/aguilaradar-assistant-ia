@@ -4,8 +4,13 @@
 //    contexte = données réelles déjà calculées par le site, construites par buildAiContext()
 //    dans js/assistant.js), demande au modèle de répondre STRICTEMENT à partir de ce contexte,
 //    renvoie { answer }. Aucune clé API à gérer : Workers AI (binding env.AI) est natif à
-//    Cloudflare. Syntaxe vérifiée le 18/08/2026 contre la documentation Cloudflare à jour
-//    (developers.cloudflare.com/workers-ai/models/llama-3.1-8b-instruct/).
+//    Cloudflare. Modèle passé à llama-3.3-70b-instruct-fp8-fast le 24/08/2026 (vérifié contre
+//    la doc Cloudflare à jour) : llama-3.1-8b-instruct est listé "Deprecated" dans le catalogue
+//    Workers AI (risque de panne silencieuse si Cloudflare le retire), et le 70B donne une bien
+//    meilleure compréhension du français/nuance — reste très large sous le palier gratuit
+//    (10 000 neurones/jour ; ~135 neurones par échange ici, soit largement >50 échanges/jour
+//    gratuits pour un usage personnel). Même forme d'appel (messages système+utilisateur,
+//    { response } en sortie), aucun autre changement nécessaire.
 //
 // 2) Envoi des notifications push (scheduled, cron) : lit data/opportunities.json et
 //    data/alerts.json (URL brute GitHub — le site est public, voir CLAUDE.md), envoie une
@@ -259,7 +264,7 @@ export default {
     if (!question) return json({ error: "empty_question" }, 400);
 
     try {
-      const result = await env.AI.run("@cf/meta/llama-3.1-8b-instruct", {
+      const result = await env.AI.run("@cf/meta/llama-3.3-70b-instruct-fp8-fast", {
         messages: [
           { role: "system", content: SYSTEM_PROMPT_PREFIX + (context || "(aucune donnée fournie ce tour-ci)") },
           { role: "user", content: question },
