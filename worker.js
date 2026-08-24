@@ -1,20 +1,31 @@
-// Relais IA gratuit pour l'Assistant AguilaRadar — Cloudflare Worker + Workers AI.
+// Deux rôles pour ce Worker, tous deux gratuits (palier gratuit Cloudflare) :
 //
-// Rôle unique : recevoir { question, context } (le contexte = données réelles déjà calculées
-// par le site, construites par buildAiContext() dans js/assistant.js), demander au modèle de
-// répondre STRICTEMENT à partir de ce contexte, renvoyer { answer }. Aucune clé API à gérer :
-// Workers AI (binding env.AI) est natif à Cloudflare, gratuit dans les limites du palier
-// gratuit du compte. Syntaxe vérifiée le 18/08/2026 contre la documentation Cloudflare à jour
-// (developers.cloudflare.com/workers-ai/models/llama-3.1-8b-instruct/).
+// 1) Relais IA pour l'Assistant AguilaRadar (fetch, POST /) : reçoit { question, context } (le
+//    contexte = données réelles déjà calculées par le site, construites par buildAiContext()
+//    dans js/assistant.js), demande au modèle de répondre STRICTEMENT à partir de ce contexte,
+//    renvoie { answer }. Aucune clé API à gérer : Workers AI (binding env.AI) est natif à
+//    Cloudflare. Syntaxe vérifiée le 18/08/2026 contre la documentation Cloudflare à jour
+//    (developers.cloudflare.com/workers-ai/models/llama-3.1-8b-instruct/).
 //
-// Déploiement : voir cloudflare-worker/README.md pour les étapes exactes (dashboard, aucune
-// ligne de commande nécessaire). Après déploiement, reporter l'URL obtenue dans
-// AI_RELAY_URL (js/config.js) à la place du placeholder.
+// 2) Envoi des notifications push (scheduled, cron) : lit data/opportunities.json et
+//    data/alerts.json (URL brute GitHub — le site est public, voir CLAUDE.md), envoie une
+//    vraie notification Web Push pour chaque nouvelle entrée jamais notifiée (état gardé dans
+//    le binding KV PUSH_STATE), en signant/chiffrant en WebCrypto pur (RFC 8291 + RFC 8292,
+//    aucune dépendance npm — voir cloudflare-worker/README.md pour la validation croisée de
+//    cette implémentation contre les bibliothèques de référence). Route GET /send-test-push
+//    (protégée par TEST_PUSH_SECRET) pour vérifier la livraison à la demande sans attendre le
+//    prochain passage du cron.
 //
-// Volontairement minimal, une seule responsabilité — même principe que les routines
-// AguilaRadar existantes (voir CLAUDE.md) : ne fait qu'un relais IA, rien d'autre.
+// Déploiement et secrets : voir cloudflare-worker/README.md — aucune ligne de commande
+// nécessaire pour le premier rôle, quelques minutes de configuration dans le tableau de bord
+// pour le second (les secrets ne peuvent jamais vivre dans ce dépôt public).
+//
+// Après déploiement, reporter l'URL obtenue dans AI_RELAY_URL (js/config.js).
 
 const ALLOWED_ORIGIN = "https://jaki2402-dev.github.io";
+const GITHUB_DATA_BASE = "https://raw.githubusercontent.com/jaki2402-dev/aguilaradar-/main/data";
+const PUSH_NOTIFIED_IDS_KV_KEY = "notified_ids";
+const MAX_TRACKED_IDS = 500;
 
 function corsHeaders() {
   return {
@@ -39,8 +50,196 @@ const SYSTEM_PROMPT_PREFIX =
   "argent sur\") — analyse informative uniquement. Réponds en français, 5 phrases maximum.\n\n" +
   "Données actuelles du site :\n";
 
+// ---- Notifications push (RFC 8291 chiffrement du contenu + RFC 8292 VAPID), WebCrypto pur ----
+// Aucune dépendance npm : crypto.subtle est nativement disponible dans les Workers, exactement
+// la même API qu'un navigateur. Implémentation validée par comparaison octet pour octet avec
+// l'implémentation de référence de l'auteur de la RFC (martinthomson/encrypted-content-encoding)
+// et par vérification indépendante de signature (Node crypto) — voir README.md.
+
+function b64urlToBytes(b64url) {
+  const b64 = b64url.replace(/-/g, "+").replace(/_/g, "/").padEnd(Math.ceil(b64url.length / 4) * 4, "=");
+  const bin = atob(b64);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return bytes;
+}
+
+function bytesToB64url(bytes) {
+  let bin = "";
+  for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+  return btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+function concatBytes(...arrs) {
+  const total = arrs.reduce((n, a) => n + a.length, 0);
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const a of arrs) {
+    out.set(a, offset);
+    offset += a.length;
+  }
+  return out;
+}
+
+// Point non compressé P-256 (0x04 || X(32) || Y(32), 65 octets) en base64url — importé en JWK,
+// le format le plus fiable pour une clé publique EC dans tous les runtimes WebCrypto.
+function uncompressedPointToJwk(bytes) {
+  if (bytes.length !== 65 || bytes[0] !== 4) throw new Error("clé publique P-256 non compressée attendue (65 octets, 0x04 en tête)");
+  return { kty: "EC", crv: "P-256", x: bytesToB64url(bytes.slice(1, 33)), y: bytesToB64url(bytes.slice(33, 65)), ext: true };
+}
+
+async function importVapidPrivateKey(privateKeyB64url, publicKeyB64url) {
+  const jwk = { ...uncompressedPointToJwk(b64urlToBytes(publicKeyB64url)), d: bytesToB64url(b64urlToBytes(privateKeyB64url)), key_ops: ["sign"] };
+  return crypto.subtle.importKey("jwk", jwk, { name: "ECDSA", namedCurve: "P-256" }, false, ["sign"]);
+}
+
+// JWT ES256 pour l'en-tête "Authorization: vapid" — signature ECDSA au format brut r||s
+// (64 octets) exigé par JWS ES256, exactement ce que crypto.subtle.sign() renvoie pour ECDSA.
+async function signVapidJwt({ audience, subject, privateKey, publicKey, expirationSeconds = 12 * 60 * 60 }) {
+  const key = await importVapidPrivateKey(privateKey, publicKey);
+  const header = { typ: "JWT", alg: "ES256" };
+  const payload = { aud: audience, exp: Math.floor(Date.now() / 1000) + expirationSeconds, sub: subject };
+  const encHeader = bytesToB64url(new TextEncoder().encode(JSON.stringify(header)));
+  const encPayload = bytesToB64url(new TextEncoder().encode(JSON.stringify(payload)));
+  const signingInput = `${encHeader}.${encPayload}`;
+  const sigBuf = await crypto.subtle.sign({ name: "ECDSA", hash: "SHA-256" }, key, new TextEncoder().encode(signingInput));
+  return `${signingInput}.${bytesToB64url(new Uint8Array(sigBuf))}`;
+}
+
+// Chiffrement du message (RFC 8291, construit sur l'encodage générique "aes128gcm" de RFC 8188).
+// Un seul enregistrement — délimiteur de padding 0x02 (dernier et unique record), pas de
+// padding supplémentaire (le message tient toujours largement sous rs=4096).
+async function encryptWebPush({ payload, p256dh, auth, ephemeralPrivateKey, ephemeralPublicKey, salt }) {
+  const uaPublicBytes = b64urlToBytes(p256dh);
+  const authSecret = b64urlToBytes(auth);
+  const asPublicBytes = b64urlToBytes(ephemeralPublicKey);
+
+  const uaPublicKey = await crypto.subtle.importKey("jwk", uncompressedPointToJwk(uaPublicBytes), { name: "ECDH", namedCurve: "P-256" }, false, []);
+  const asPrivateJwk = { ...uncompressedPointToJwk(asPublicBytes), d: bytesToB64url(b64urlToBytes(ephemeralPrivateKey)) };
+  const asPrivateKey = await crypto.subtle.importKey("jwk", asPrivateJwk, { name: "ECDH", namedCurve: "P-256" }, false, ["deriveBits"]);
+  const ecdhSecret = new Uint8Array(await crypto.subtle.deriveBits({ name: "ECDH", public: uaPublicKey }, asPrivateKey, 256));
+
+  // Couche 1 (spécifique RFC 8291) : ECDH -> IKM, salt=auth_secret, info="WebPush: info\0" || ua_public || as_public.
+  const webpushInfo = concatBytes(new TextEncoder().encode("WebPush: info\0"), uaPublicBytes, asPublicBytes);
+  const ecdhSecretKey = await crypto.subtle.importKey("raw", ecdhSecret, "HKDF", false, ["deriveBits"]);
+  const ikm = new Uint8Array(await crypto.subtle.deriveBits({ name: "HKDF", hash: "SHA-256", salt: authSecret, info: webpushInfo }, ecdhSecretKey, 256));
+
+  // Couche 2 (générique RFC 8188 aes128gcm) : IKM -> clé de chiffrement + nonce, salt=salt aléatoire du header.
+  const ikmKey = await crypto.subtle.importKey("raw", ikm, "HKDF", false, ["deriveBits"]);
+  const cekBytes = new Uint8Array(await crypto.subtle.deriveBits({ name: "HKDF", hash: "SHA-256", salt, info: new TextEncoder().encode("Content-Encoding: aes128gcm\0") }, ikmKey, 128));
+  const nonce = new Uint8Array(await crypto.subtle.deriveBits({ name: "HKDF", hash: "SHA-256", salt, info: new TextEncoder().encode("Content-Encoding: nonce\0") }, ikmKey, 96));
+
+  const cek = await crypto.subtle.importKey("raw", cekBytes, "AES-GCM", false, ["encrypt"]);
+  const paddedPlaintext = concatBytes(payload, new Uint8Array([2]));
+  const ciphertext = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv: nonce, tagLength: 128 }, cek, paddedPlaintext));
+
+  const rs = new Uint8Array(4);
+  new DataView(rs.buffer).setUint32(0, 4096, false);
+  return concatBytes(salt, rs, new Uint8Array([asPublicBytes.length]), asPublicBytes, ciphertext);
+}
+
+async function sendPushNotification(env, subscription, title, body, tag) {
+  const ephemeral = await crypto.subtle.generateKey({ name: "ECDH", namedCurve: "P-256" }, true, ["deriveBits"]);
+  const ephemeralPublicRaw = new Uint8Array(await crypto.subtle.exportKey("raw", ephemeral.publicKey));
+  const ephemeralPrivateJwk = await crypto.subtle.exportKey("jwk", ephemeral.privateKey);
+  const salt = crypto.getRandomValues(new Uint8Array(16));
+
+  const encryptedBody = await encryptWebPush({
+    payload: new TextEncoder().encode(JSON.stringify({ title, body, tag })),
+    p256dh: subscription.keys.p256dh,
+    auth: subscription.keys.auth,
+    ephemeralPrivateKey: ephemeralPrivateJwk.d,
+    ephemeralPublicKey: bytesToB64url(ephemeralPublicRaw),
+    salt,
+  });
+
+  const jwt = await signVapidJwt({
+    audience: new URL(subscription.endpoint).origin,
+    subject: "mailto:jaki2402@gmail.com",
+    privateKey: env.VAPID_PRIVATE_KEY,
+    publicKey: env.VAPID_PUBLIC_KEY,
+  });
+
+  const res = await fetch(subscription.endpoint, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/octet-stream",
+      "Content-Encoding": "aes128gcm",
+      "TTL": "86400",
+      "Authorization": `vapid t=${jwt}, k=${env.VAPID_PUBLIC_KEY}`,
+    },
+    body: encryptedBody,
+  });
+  if (!res.ok) throw new Error(`push ${res.status}: ${await res.text().catch(() => "")}`);
+  return res;
+}
+
+// Même construction d'id/titre/texte que checkForNewOpportunities (js/notify.js) pour les
+// opportunités. Pour les alertes en revanche, PAS le même filtre de type : notify.js ne
+// notifie que les types "opportunite"/"signal_precoce", mais alerts.json aujourd'hui n'émet
+// que seuil_technique/actualite_macro/actualite_favori — filtrer sur ces deux seuls types
+// laisserait ce Worker muet en permanence malgré un flux d'alertes réellement actif. Chaque
+// entrée d'alerts.json est déjà jugée alerte-digne par la routine qui l'écrit (seuil franchi,
+// actu vérifiée...), aucun filtre supplémentaire n'est nécessaire ici.
+function buildNotifiableItems(opportunitiesData, alertsData) {
+  const items = [];
+  ((opportunitiesData && opportunitiesData.opportunities) || []).forEach((o) => {
+    items.push({ id: "opp-" + (o.id || o.ticker), title: "Nouvelle opportunité", body: `${o.ticker} — ${o.reason || "détectée par le criblage"}` });
+  });
+  (alertsData || []).forEach((a) => {
+    items.push({ id: "alert-" + (a.id || `${a.type}-${a.triggered_at}-${a.ticker_ou_theme || a.ticker || ""}`), title: "AguilaRadar", body: a.message || "" });
+  });
+  return items;
+}
+
+// isBaseline (aucun état KV encore) : enregistre tout ce qui existe déjà sans notifier, sinon
+// le premier passage après déploiement envoie d'un coup toutes les alertes déjà accumulées.
+async function runPushCycle(env) {
+  const subscription = JSON.parse(env.PUSH_SUBSCRIPTION_JSON);
+  const [oppRes, alertsRes] = await Promise.all([
+    fetch(`${GITHUB_DATA_BASE}/opportunities.json`),
+    fetch(`${GITHUB_DATA_BASE}/alerts.json`),
+  ]);
+  const items = buildNotifiableItems(oppRes.ok ? await oppRes.json() : null, alertsRes.ok ? await alertsRes.json() : null);
+
+  const stored = await env.PUSH_STATE.get(PUSH_NOTIFIED_IDS_KV_KEY);
+  const isBaseline = stored === null;
+  const seen = isBaseline ? new Set() : new Set(JSON.parse(stored));
+
+  let sent = 0;
+  for (const item of items) {
+    if (seen.has(item.id)) continue;
+    seen.add(item.id);
+    if (!isBaseline) {
+      try {
+        await sendPushNotification(env, subscription, item.title, item.body, item.id);
+        sent++;
+      } catch (e) {
+        console.error("Envoi push échoué pour " + item.id + " :", e);
+      }
+    }
+  }
+  await env.PUSH_STATE.put(PUSH_NOTIFIED_IDS_KV_KEY, JSON.stringify(Array.from(seen).slice(-MAX_TRACKED_IDS)));
+  return { total: items.length, sent, isBaseline };
+}
+
 export default {
   async fetch(request, env) {
+    const url = new URL(request.url);
+
+    if (url.pathname === "/send-test-push") {
+      if (!env.TEST_PUSH_SECRET || url.searchParams.get("secret") !== env.TEST_PUSH_SECRET) {
+        return json({ error: "unauthorized" }, 401);
+      }
+      try {
+        const subscription = JSON.parse(env.PUSH_SUBSCRIPTION_JSON);
+        await sendPushNotification(env, subscription, "AguilaRadar — test", "Si tu vois ceci, les notifications push fonctionnent.", "test-push");
+        return json({ ok: true }, 200);
+      } catch (e) {
+        return json({ error: String(e && e.message || e) }, 500);
+      }
+    }
+
     if (request.method === "OPTIONS") {
       return new Response(null, { headers: corsHeaders() });
     }
@@ -71,5 +270,16 @@ export default {
     } catch (e) {
       return json({ error: "ai_error" }, 500);
     }
+  },
+
+  // Cron Trigger (voir wrangler.jsonc "triggers.crons") — ctx.waitUntil garde le Worker vivant
+  // le temps que le cycle (fetch GitHub + envoi push) se termine, au-delà du retour immédiat
+  // attendu par la plateforme pour ce type d'invocation.
+  async scheduled(controller, env, ctx) {
+    ctx.waitUntil(
+      runPushCycle(env)
+        .then((result) => console.log("Cycle push :", JSON.stringify(result)))
+        .catch((e) => console.error("Cycle push échoué :", e))
+    );
   },
 };

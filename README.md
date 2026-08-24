@@ -43,3 +43,45 @@ Le chat ne casse jamais à cause de ça : si le Worker n'est pas encore configur
 ou en panne, l'Assistant retombe silencieusement sur son comportement actuel (aucune régression
 possible, voir `fetchLiveAiFallback` dans `js/assistant.js`). Pas de panique si quelque chose
 coince pendant la mise en place.
+
+## Notifications push (deuxième rôle de ce même Worker)
+
+Le même Worker déployé ci-dessus lit `data/opportunities.json` et `data/alerts.json` toutes les
+15 minutes (Cron Trigger) et envoie une vraie notification Web Push — reçue même app/onglet
+fermé — pour chaque nouvelle entrée jamais notifiée. Chiffrement (RFC 8291) et signature VAPID
+(RFC 8292) en WebCrypto pur, aucune dépendance à installer.
+
+**Pourquoi des étapes manuelles ici, contrairement au relais IA ci-dessus** : ce Worker a
+besoin de secrets véritables (clé privée VAPID, abonnement push) — des valeurs qui ne peuvent
+jamais vivre dans ce dépôt public, donc jamais dans le flux "Deploy to Cloudflare" automatique.
+3 minutes de configuration dans le tableau de bord, une seule fois.
+
+1. **Redéployer le code** : Worker → **Modifier le code** → sélectionne tout → colle le contenu
+   à jour de `worker.js` → **Déployer**.
+2. **Lier le KV déjà créé** : **Paramètres** → **Liaisons** → **Ajouter** → **Espace de noms
+   KV** → nom de variable `PUSH_STATE` (exactement ce nom) → sélectionne l'espace de noms
+   `aguilaradar-push-state` → **Déployer**.
+3. **Ajouter le Cron Trigger** : **Paramètres** → **Déclencheurs** → **Cron Triggers** →
+   **Ajouter** → `*/15 * * * *` → **Ajouter**.
+4. **Ajouter les 4 secrets** : **Paramètres** → **Variables et secrets** → **Ajouter**, type
+   **Secret**, une fois pour chacun de `VAPID_PRIVATE_KEY`, `VAPID_PUBLIC_KEY`,
+   `PUSH_SUBSCRIPTION_JSON`, `TEST_PUSH_SECRET` — valeurs transmises séparément (jamais dans ce
+   dépôt).
+5. **Tester tout de suite**, sans attendre le prochain passage du cron : ouvre
+   `https://aguilaradar-assistant-ia.<ton-compte>.workers.dev/send-test-push?secret=<TEST_PUSH_SECRET>`
+   dans un navigateur. Une notification doit arriver sur l'appareil abonné dans la minute — si
+   rien n'arrive, regarde les **Logs** temps réel du Worker (onglet **Logs** du tableau de bord)
+   pendant que tu réessaies, le message d'erreur y apparaît en clair.
+
+**Si `PUSH_SUBSCRIPTION_JSON` devient invalide** (abonnement expiré ou révoqué côté navigateur) :
+rouvre le site → onglet Alertes → si un abonnement existe déjà, clique **Régénérer le code** →
+colle le nouveau JSON obtenu dans le secret `PUSH_SUBSCRIPTION_JSON` (remplace l'ancienne
+valeur, mêmes étapes qu'à la création).
+
+**Validation de l'implémentation cryptographique** (avant tout déploiement) : le chiffrement a
+été comparé octet pour octet à l'implémentation de référence de l'auteur de la RFC
+(`martinthomson/encrypted-content-encoding`) sur des clés fixes, et la signature VAPID vérifiée
+indépendamment par Node `crypto` (bibliothèque distincte de celle utilisée pour signer) — les
+deux avec succès. Un seul point n'a pu être testé que via l'endpoint `/send-test-push` ci-dessus
+plutôt qu'à l'avance : la livraison réelle jusqu'à un appareil, qui dépend du service push du
+navigateur (Apple/Google/Mozilla) et non de ce code.

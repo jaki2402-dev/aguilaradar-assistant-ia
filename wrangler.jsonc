@@ -5,5 +5,18 @@
   "compatibility_date": "2026-08-18",
   "ai": {
     "binding": "AI"
+  },
+  // Mémoire des notifications déjà envoyées (voir runPushCycle, worker.js) — aucune donnée
+  // sensible dedans, juste une liste d'identifiants d'alertes/opportunités déjà notifiées.
+  "kv_namespaces": [
+    {
+      "binding": "PUSH_STATE",
+      "id": "599dbd02274c4e458fb7b1f8f628fd45"
+    }
+  ],
+  // Toutes les 15 minutes : assez réactif pour une vraie notification "en direct", très large
+  // marge sous les limites du palier gratuit (~2900 invocations/mois pour ce cron à lui seul).
+  "triggers": {
+    "crons": ["*/15 * * * *"]
   }
 }
