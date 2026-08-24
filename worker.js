@@ -47,13 +47,26 @@ function json(obj, status) {
   });
 }
 
+// Ton "expert" demandé explicitement par l'utilisateur (24/08) : une vraie prise de position
+// argumentée plutôt qu'une réponse évasive — mais les garde-fous anti-hallucination/anti-conseil
+// réglementé sont renforcés en même temps, pas assouplis, précisément pour que ce ton plus
+// affirmé reste ancré dans les données réelles plutôt que dans une impression générale du modèle.
 const SYSTEM_PROMPT_PREFIX =
-  "Tu es l'assistant du site AguilaRadar, un radar de marché crypto. Réponds UNIQUEMENT à partir " +
-  "des données ci-dessous — jamais un prix, un fait ou un verdict qui n'y figure pas explicitement. " +
-  "Si les données ne permettent pas de répondre à la question, dis-le clairement plutôt que " +
-  "d'inventer. Jamais de conseil d'investissement réglementé (\"achète\", \"vends\", \"place ton " +
-  "argent sur\") — analyse informative uniquement. Réponds en français, 5 phrases maximum.\n\n" +
-  "Données actuelles du site :\n";
+  "Tu es l'analyste expert du site AguilaRadar, spécialiste des marchés crypto. Tu raisonnes comme " +
+  "un vrai analyste financier expérimenté : tu prends position clairement sur les signaux " +
+  "disponibles (technique, fondamental, macro), tu expliques ton raisonnement avec précision — " +
+  "jamais une réponse évasive du type \"je ne peux pas savoir\" quand les données permettent une " +
+  "vraie lecture.\n\n" +
+  "Règles strictes, non négociables : réponds UNIQUEMENT à partir des données ci-dessous — ne " +
+  "complète JAMAIS avec une connaissance générale non vérifiée, ne cite JAMAIS un prix, un " +
+  "pourcentage, un verdict ou un fait qui n'y figure pas explicitement ; si une donnée te manque " +
+  "pour répondre, dis-le clairement plutôt que de l'estimer ou de l'halluciner. Ton rôle reste " +
+  "l'interprétation de signaux déjà mesurés, jamais un ordre à exécuter : aucune instruction " +
+  "d'achat/vente/placement (\"achète\", \"vends\", \"investis maintenant\"), aucune promesse de " +
+  "gain — un vrai professionnel distingue toujours une lecture de marché d'un conseil réglementé, " +
+  "et toi aussi. Réponds en français, 5 phrases maximum, avec la précision d'un expert, jamais des " +
+  "généralités vagues.\n\n" +
+  "Données actuelles du site (analyse-les vraiment avant de répondre) :\n";
 
 // ---- Notifications push (RFC 8291 chiffrement du contenu + RFC 8292 VAPID), WebCrypto pur ----
 // Aucune dépendance npm : crypto.subtle est nativement disponible dans les Workers, exactement
@@ -260,7 +273,14 @@ export default {
     }
 
     const question = String(body.question || "").slice(0, 500).trim();
-    const context = String(body.context || "").slice(0, 6000);
+    // 20000 (pas 6000, plafond d'origine) : buildAiContext() (js/assistant.js) envoie désormais
+    // "tout aguilaradar" (chaque favori nommément, toutes les opportunités, 8 dernières alertes,
+    // 8 dernières actualités) plutôt qu'un résumé agrégé, mesuré à ~11 000 caractères en usage
+    // réel le 24/08 — 6000 aurait tronqué silencieusement la fin (actualités, alertes récentes)
+    // avant même que le modèle les voie. Le modèle a 24 000 tokens de fenêtre de contexte
+    // (~90 000+ caractères) : 20000 caractères de contexte laisse une marge large pour la
+    // croissance future sans jamais s'approcher de la vraie limite du modèle.
+    const context = String(body.context || "").slice(0, 20000);
     if (!question) return json({ error: "empty_question" }, 400);
 
     try {
