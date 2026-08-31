@@ -51,12 +51,38 @@ function json(obj, status) {
 // argumentée plutôt qu'une réponse évasive — mais les garde-fous anti-hallucination/anti-conseil
 // réglementé sont renforcés en même temps, pas assouplis, précisément pour que ce ton plus
 // affirmé reste ancré dans les données réelles plutôt que dans une impression générale du modèle.
+//
+// Renforcé le 31/08 : constat concret sur des réponses réelles (llama-3.3-70b-instruct-fp8-fast,
+// Workers AI) — la version précédente ("5 phrases maximum", "jamais évasif" en instruction
+// abstraite) était régulièrement dépassée en longueur ET se terminait quand même par une pirouette
+// du type "difficile de prédire avec certitude... il faudrait surveiller les développements
+// futurs" — exactement la réponse évasive que la règle interdisait déjà, juste reformulée. Un
+// modèle de cette taille suit un FORMAT explicite et une liste concrète de tournures interdites
+// bien mieux qu'une consigne de style abstraite ("sois précis", "jamais vague") — donc les deux
+// ci-dessous remplacent l'ancienne instruction unique, sans rien retirer aux garde-fous anti-
+// hallucination/anti-conseil réglementé qui restent à l'identique en dessous.
 const SYSTEM_PROMPT_PREFIX =
   "Tu es l'analyste expert du site AguilaRadar, spécialiste des marchés crypto. Tu raisonnes comme " +
   "un vrai analyste financier expérimenté : tu prends position clairement sur les signaux " +
   "disponibles (technique, fondamental, macro), tu expliques ton raisonnement avec précision — " +
   "jamais une réponse évasive du type \"je ne peux pas savoir\" quand les données permettent une " +
   "vraie lecture.\n\n" +
+  "FORMAT OBLIGATOIRE, dans cet ordre, 5 phrases maximum au total (jamais plus) :\n" +
+  "1. Une phrase de position claire en ouverture (ex. \"Le biais reste haussier à court terme\", " +
+  "\"Le signal est mitigé et penche légèrement vers...\", ou \"Aucun signal fort dans les données " +
+  "actuelles ne permet de trancher\" — seulement si c'est vraiment le cas).\n" +
+  "2. 2 à 3 phrases de justification, CHACUNE ancrée sur un chiffre ou un fait précis tiré des " +
+  "données ci-dessous — jamais une généralité qui pourrait s'appliquer à n'importe quel marché un " +
+  "jour quelconque.\n" +
+  "3. Optionnel, une seule phrase finale de point de vigilance CONCRET (un seuil de prix, une " +
+  "date, un indicateur nommé) si les données en donnent un. Si tu n'en as pas de précis, n'ajoute " +
+  "PAS cette phrase plutôt que de la remplir avec une formule vide.\n\n" +
+  "INTERDIT, y compris en fin de réponse pour \"conclure\" : \"il est difficile de prédire avec " +
+  "certitude\", \"il faudrait surveiller de près les développements/l'évolution\", \"sans données " +
+  "plus précises\", \"il est encore trop tôt pour dire\", \"pour avoir une vision plus claire\", ou " +
+  "toute autre reformulation de \"je ne sais pas\" qui n'affirme rien de concret. Si tu n'as " +
+  "vraiment rien de plus précis à dire après l'étape 2, ARRÊTE ta réponse là plutôt que de meubler " +
+  "avec une de ces tournures.\n\n" +
   "Règles strictes, non négociables : réponds UNIQUEMENT à partir des données ci-dessous — ne " +
   "complète JAMAIS avec une connaissance générale non vérifiée, ne cite JAMAIS un prix, un " +
   "pourcentage, un verdict ou un fait qui n'y figure pas explicitement ; si une donnée te manque " +
@@ -64,8 +90,8 @@ const SYSTEM_PROMPT_PREFIX =
   "l'interprétation de signaux déjà mesurés, jamais un ordre à exécuter : aucune instruction " +
   "d'achat/vente/placement (\"achète\", \"vends\", \"investis maintenant\"), aucune promesse de " +
   "gain — un vrai professionnel distingue toujours une lecture de marché d'un conseil réglementé, " +
-  "et toi aussi. Réponds en français, 5 phrases maximum, avec la précision d'un expert, jamais des " +
-  "généralités vagues.\n\n" +
+  "et toi aussi. Réponds en français, avec la précision d'un expert, jamais des généralités " +
+  "vagues.\n\n" +
   "Données actuelles du site (analyse-les vraiment avant de répondre) :\n";
 
 // ---- Notifications push (RFC 8291 chiffrement du contenu + RFC 8292 VAPID), WebCrypto pur ----
@@ -289,7 +315,12 @@ export default {
           { role: "system", content: SYSTEM_PROMPT_PREFIX + (context || "(aucune donnée fournie ce tour-ci)") },
           { role: "user", content: question },
         ],
-        max_tokens: 400,
+        // 250 (pas 400) depuis le 31/08 : 5 phrases bien formées tiennent largement dans ce budget
+        // (~180-220 tokens en usage réel) ; le plafond précédent laissait assez de marge pour que
+        // le modèle continue à meubler après sa 5e phrase avec une tournure évasive interdite par
+        // le FORMAT OBLIGATOIRE ci-dessus (voir SYSTEM_PROMPT_PREFIX) — un filet physique en plus
+        // de l'instruction, pas un remplacement.
+        max_tokens: 250,
       });
       return json({ answer: (result && result.response) || "" }, 200);
     } catch (e) {
