@@ -85,3 +85,46 @@ indépendamment par Node `crypto` (bibliothèque distincte de celle utilisée po
 deux avec succès. Un seul point n'a pu être testé que via l'endpoint `/send-test-push` ci-dessus
 plutôt qu'à l'avance : la livraison réelle jusqu'à un appareil, qui dépend du service push du
 navigateur (Apple/Google/Mozilla) et non de ce code.
+
+## Écriture directe des transactions du portefeuille (troisième rôle de ce même Worker)
+
+Le même Worker déployé ci-dessus peut aussi recevoir une transaction (achat/vente) depuis le
+formulaire de l'onglet Portefeuille du site et l'écrire directement dans `data/portfolio.json`
+(un vrai commit git), au lieu du copier-coller manuel qui reste le comportement par défaut tant
+que ce rôle n'est pas configuré.
+
+**Important, à lire avant de configurer ce rôle** : ce n'est pas une vraie sécurité, exactement
+comme le portail d'accès du site (voir `CLAUDE.md`, section "Portail d'accès"). Le code source de
+ce Worker et du site est public — un secret côté client ne peut jamais être un vrai secret. La
+protection ici (en-tête secret + limite de 20 tentatives/heure, voir `handleTransactionRequest`
+dans `worker.js`) filtre un visiteur qui tombe dessus par hasard, pas quelqu'un de déterminé qui
+lit le code. Risque jugé acceptable pour ce projet : `data/portfolio.json` est une simulation
+déclarée à la main, jamais connectée à un vrai compte ou wallet, et tout commit reste réversible
+dans l'historique git. Choisis un code d'écriture long et aléatoire (pas un code à 4 chiffres) —
+il n'y a pas de vraie limitation de débit au-delà des 20/heure ci-dessus.
+
+**Pourquoi des étapes manuelles ici, comme pour les notifications push** : ce rôle a besoin d'un
+vrai token GitHub avec droit d'écriture — une valeur qui ne peut jamais vivre dans ce dépôt
+public, donc jamais dans le flux "Deploy to Cloudflare" automatique.
+
+1. **Redéployer le code** : Worker → **Modifier le code** → sélectionne tout → colle le contenu
+   à jour de `worker.js` → **Déployer**.
+2. **Créer un token GitHub dédié** : [github.com/settings/tokens?type=beta](https://github.com/settings/tokens?type=beta)
+   → **Generate new token** → **Fine-grained**, accès limité au seul dépôt `aguilaradar-`,
+   permission **Contents : Read and write** (rien d'autre) → génère et copie le token (visible une
+   seule fois).
+3. **Ajouter les 2 secrets** : **Paramètres** → **Variables et secrets** → **Ajouter**, type
+   **Secret**, une fois pour chacun de `GITHUB_WRITE_TOKEN` (le token créé à l'étape 2) et
+   `PORTFOLIO_WRITE_SECRET` (le code d'écriture choisi ci-dessus, long et aléatoire) — valeurs
+   transmises séparément (jamais dans ce dépôt).
+4. **Reporter l'URL dans le site** : colle `https://aguilaradar-assistant-ia.<ton-compte>.workers.dev/transaction`
+   dans `PORTFOLIO_WRITE_URL` (`js/config.js`), à la place du placeholder `REMPLACE-MOI-...`.
+5. **Tester tout de suite** : ouvre le site, onglet Portefeuille → "Ajouter un achat ou une
+   vente" → le bouton doit maintenant afficher "Enregistrer" et un champ "Code d'écriture" doit
+   être visible. Saisis le code choisi à l'étape 3, remplis une transaction, envoie. En cas
+   d'échec, regarde les **Logs** temps réel du Worker (onglet **Logs** du tableau de bord) pendant
+   que tu réessaies.
+
+**Le KV `PUSH_STATE` déjà lié (voir la section notifications push ci-dessus) est réutilisé tel
+quel** pour compter les tentatives par heure — aucun espace de noms supplémentaire à créer ni à
+lier pour ce rôle.

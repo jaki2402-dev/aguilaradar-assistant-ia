@@ -1,4 +1,4 @@
-// Deux rôles pour ce Worker, tous deux gratuits (palier gratuit Cloudflare) :
+// Trois rôles pour ce Worker, tous gratuits (palier gratuit Cloudflare) :
 //
 // 1) Relais IA pour l'Assistant AguilaRadar (fetch, POST /) : reçoit { question, context } (le
 //    contexte = données réelles déjà calculées par le site, construites par buildAiContext()
@@ -21,16 +21,33 @@
 //    (protégée par TEST_PUSH_SECRET) pour vérifier la livraison à la demande sans attendre le
 //    prochain passage du cron.
 //
+// 3) Écriture directe d'une transaction du portefeuille (fetch, POST /transaction) : reçoit
+//    {cgId, qty, invested} déjà calculé côté client (computeTransactionResult, js/portfolio.js —
+//    jamais recalculé ici) et committe le nouveau data/portfolio.json via l'API GitHub Contents,
+//    pour que le formulaire du site puisse enregistrer une transaction sans copier-coller manuel.
+//    Protection à 2 couches (voir handleTransactionRequest plus bas) — NI L'UNE NI L'AUTRE une
+//    vraie sécurité sur un dépôt/site public, exactement comme le portail d'accès du site (voir
+//    CLAUDE.md) : ça filtre un visiteur qui tombe dessus par hasard, pas quelqu'un de déterminé
+//    qui lit ce code public. Risque réel jugé acceptable pour ce projet : portfolio.json est une
+//    simulation déclarée à la main, jamais connectée à un vrai compte/wallet, et tout commit reste
+//    réversible dans l'historique git.
+//
 // Déploiement et secrets : voir cloudflare-worker/README.md — aucune ligne de commande
 // nécessaire pour le premier rôle, quelques minutes de configuration dans le tableau de bord
-// pour le second (les secrets ne peuvent jamais vivre dans ce dépôt public).
+// pour les deux autres (les secrets ne peuvent jamais vivre dans ce dépôt public).
 //
-// Après déploiement, reporter l'URL obtenue dans AI_RELAY_URL (js/config.js).
+// Après déploiement, reporter l'URL obtenue dans AI_RELAY_URL (js/config.js) et, une fois le
+// rôle 3 configuré (secrets + token GitHub, voir README), dans PORTFOLIO_WRITE_URL (même fichier,
+// URL + "/transaction").
 
 const ALLOWED_ORIGIN = "https://jaki2402-dev.github.io";
 const GITHUB_DATA_BASE = "https://raw.githubusercontent.com/jaki2402-dev/aguilaradar-/main/data";
+const GITHUB_API_BASE = "https://api.github.com/repos/jaki2402-dev/aguilaradar-/contents";
+const PORTFOLIO_PATH = "data/portfolio.json";
 const PUSH_NOTIFIED_IDS_KV_KEY = "notified_ids";
 const MAX_TRACKED_IDS = 500;
+const TX_RATE_LIMIT_PREFIX = "tx_attempts_";
+const TX_RATE_LIMIT_MAX_PER_HOUR = 20;
 
 function corsHeaders() {
   return {
@@ -61,6 +78,12 @@ function json(obj, status) {
 // bien mieux qu'une consigne de style abstraite ("sois précis", "jamais vague") — donc les deux
 // ci-dessous remplacent l'ancienne instruction unique, sans rien retirer aux garde-fous anti-
 // hallucination/anti-conseil réglementé qui restent à l'identique en dessous.
+//
+// Ce commentaire et le renforcement du 31/08 existaient déjà sur le Worker RÉELLEMENT déployé,
+// jamais reportés ici avant le 02/09 (voir CLAUDE.md : le Worker watch un dépôt SÉPARÉ,
+// jamais celui-ci — l'écart peut donc aussi se creuser dans ce sens, pas seulement "ce dépôt en
+// avance sur le déploiement"). Comparé caractère pour caractère au texte réellement en prod avant
+// de committer ce correctif.
 const SYSTEM_PROMPT_PREFIX =
   "Tu es l'analyste expert du site AguilaRadar, spécialiste des marchés crypto. Tu raisonnes comme " +
   "un vrai analyste financier expérimenté : tu prends position clairement sur les signaux " +
@@ -267,6 +290,108 @@ async function runPushCycle(env) {
   return { total: items.length, sent, isBaseline };
 }
 
+// ---- Écriture directe du portefeuille (3e rôle, voir l'en-tête du fichier) --------------------
+
+function bytesToB64(bytes) {
+  let bin = "";
+  for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+  return btoa(bin);
+}
+
+// L'API GitHub Contents renvoie le fichier en base64 des OCTETS UTF-8 bruts — atob() seul donne
+// une chaîne "binaire" (1 code unit par octet, pas par caractère), jamais du texte UTF-8 valide
+// tel quel dès qu'un accent apparaît (ex. "Écart", "réserve") : TextDecoder ci-dessous refait
+// correctement le lien octet -> caractère, comme bytesToB64/TextEncoder le font dans l'autre sens.
+function b64ToUtf8Text(b64) {
+  const bin = atob(b64.replace(/\n/g, ""));
+  const bytes = Uint8Array.from(bin, (c) => c.charCodeAt(0));
+  return new TextDecoder().decode(bytes);
+}
+
+// Limite de tentatives par heure (compteur KV, réutilise le binding PUSH_STATE déjà lié pour le
+// rôle 2 — jamais besoin d'un 2e espace de noms à provisionner). expirationTtl (2h, pas de purge
+// manuelle) : le compteur de l'heure précédente disparaît de lui-même. Seule protection
+// supplémentaire raisonnable sans vrai serveur dédié contre un essai automatisé de deviner
+// env.PORTFOLIO_WRITE_SECRET — ralentit, ne bloque pas un attaquant patient (voir l'en-tête du
+// fichier sur les limites réelles de cette protection).
+async function checkAndBumpRateLimit(env) {
+  const hourBucket = Math.floor(Date.now() / 3600000);
+  const key = `${TX_RATE_LIMIT_PREFIX}${hourBucket}`;
+  const current = parseInt((await env.PUSH_STATE.get(key)) || "0", 10);
+  if (current >= TX_RATE_LIMIT_MAX_PER_HOUR) return false;
+  await env.PUSH_STATE.put(key, String(current + 1), { expirationTtl: 7200 });
+  return true;
+}
+
+// Lit data/portfolio.json (API GitHub Contents, pas l'URL brute utilisée ailleurs dans ce fichier :
+// il faut le sha courant du fichier pour pouvoir l'écrire), remplace qty/invested de la position
+// cgId, écrit le résultat en un seul commit. qty/invested arrivent déjà calculés (coût moyen
+// pondéré, voir computeTransactionResult côté client) — cette fonction ne fait AUCUN calcul
+// financier, uniquement lire/modifier/écrire, pour ne jamais dupliquer cette logique à 2 endroits.
+async function updatePortfolioPosition(env, { cgId, qty, invested }) {
+  const apiUrl = `${GITHUB_API_BASE}/${PORTFOLIO_PATH}`;
+  const headers = {
+    "Authorization": `Bearer ${env.GITHUB_WRITE_TOKEN}`,
+    "Accept": "application/vnd.github+json",
+    "User-Agent": "aguilaradar-worker",
+  };
+
+  const getRes = await fetch(apiUrl, { headers });
+  if (!getRes.ok) throw new Error(`lecture GitHub échouée (${getRes.status})`);
+  const getData = await getRes.json();
+  const portfolio = JSON.parse(b64ToUtf8Text(getData.content));
+
+  const positions = portfolio.positions || [];
+  const idx = positions.findIndex((p) => p.cgId === cgId);
+  if (idx === -1) throw new Error(`position "${cgId}" introuvable dans portfolio.json`);
+  positions[idx] = { ...positions[idx], qty, invested, pending: false };
+  portfolio.updated_at = new Date().toISOString().slice(0, 10);
+
+  const newContentB64 = bytesToB64(new TextEncoder().encode(JSON.stringify(portfolio, null, 2) + "\n"));
+  const putRes = await fetch(apiUrl, {
+    method: "PUT",
+    headers: { ...headers, "Content-Type": "application/json" },
+    body: JSON.stringify({ message: `Transaction portefeuille : ${cgId}`, content: newContentB64, sha: getData.sha }),
+  });
+  if (!putRes.ok) throw new Error(`écriture GitHub échouée (${putRes.status}: ${await putRes.text().catch(() => "")})`);
+}
+
+// Point d'entrée de la route POST /transaction — voir l'en-tête du fichier pour la vue d'ensemble
+// des 2 couches de protection. env.PORTFOLIO_WRITE_SECRET absent (rôle jamais configuré) : 501
+// explicite plutôt qu'un 401 trompeur (qui laisserait croire qu'un bon code existe quelque part).
+async function handleTransactionRequest(request, env) {
+  if (!env.PORTFOLIO_WRITE_SECRET) return json({ error: "not_configured" }, 501);
+
+  const withinLimit = await checkAndBumpRateLimit(env);
+  if (!withinLimit) return json({ error: "rate_limited" }, 429);
+
+  if (request.headers.get("X-Portfolio-Secret") !== env.PORTFOLIO_WRITE_SECRET) {
+    return json({ error: "unauthorized" }, 401);
+  }
+
+  let body;
+  try {
+    body = await request.json();
+  } catch (e) {
+    return json({ error: "invalid_json" }, 400);
+  }
+
+  const cgId = String(body.cgId || "").trim();
+  const qty = Number(body.qty);
+  const invested = Number(body.invested);
+  if (!cgId || !Number.isFinite(qty) || qty < 0 || !Number.isFinite(invested) || invested < 0) {
+    return json({ error: "invalid_payload" }, 400);
+  }
+
+  try {
+    await updatePortfolioPosition(env, { cgId, qty, invested });
+    return json({ ok: true }, 200);
+  } catch (e) {
+    console.error("Écriture portefeuille échouée :", e);
+    return json({ error: "write_failed" }, 500);
+  }
+}
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -289,6 +414,10 @@ export default {
     }
     if (request.method !== "POST") {
       return json({ error: "method_not_allowed" }, 405);
+    }
+
+    if (url.pathname === "/transaction") {
+      return handleTransactionRequest(request, env);
     }
 
     let body;
@@ -319,7 +448,7 @@ export default {
         // (~180-220 tokens en usage réel) ; le plafond précédent laissait assez de marge pour que
         // le modèle continue à meubler après sa 5e phrase avec une tournure évasive interdite par
         // le FORMAT OBLIGATOIRE ci-dessus (voir SYSTEM_PROMPT_PREFIX) — un filet physique en plus
-        // de l'instruction, pas un remplacement.
+        // de l'instruction, pas un remplacement. Même changement que côté déployé, reporté ici.
         max_tokens: 250,
       });
       return json({ answer: (result && result.response) || "" }, 200);
