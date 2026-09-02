@@ -49,11 +49,17 @@ const MAX_TRACKED_IDS = 500;
 const TX_RATE_LIMIT_PREFIX = "tx_attempts_";
 const TX_RATE_LIMIT_MAX_PER_HOUR = 20;
 
+// X-Portfolio-Secret ajouté le 02/09 (route /transaction, voir handleTransactionRequest plus
+// bas) : sans lui dans cette liste, le préflight CORS du navigateur rejette la requête réelle
+// AVANT même qu'elle parte — jamais une erreur HTTP renvoyée par ce Worker, juste un échec de
+// fetch() côté client indiscernable d'une vraie coupure réseau (bug réel constaté ici : le
+// smoke test Node de handleTransactionRequest appelle la logique directement, sans passer par
+// l'application CORS d'un vrai navigateur, donc ne pouvait pas attraper celui-ci).
 function corsHeaders() {
   return {
     "Access-Control-Allow-Origin": ALLOWED_ORIGIN,
     "Access-Control-Allow-Methods": "POST, OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type",
+    "Access-Control-Allow-Headers": "Content-Type, X-Portfolio-Secret",
   };
 }
 
