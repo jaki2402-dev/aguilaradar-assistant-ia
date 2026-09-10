@@ -9,8 +9,16 @@
 //    Workers AI (risque de panne silencieuse si Cloudflare le retire), et le 70B donne une bien
 //    meilleure compréhension du français/nuance — reste très large sous le palier gratuit
 //    (10 000 neurones/jour ; ~135 neurones par échange ici, soit largement >50 échanges/jour
-//    gratuits pour un usage personnel). Même forme d'appel (messages système+utilisateur,
-//    { response } en sortie), aucun autre changement nécessaire.
+//    gratuits pour un usage personnel).
+//    Depuis le 10/09/2026, DEUX modèles selon le format (voir modelForMode) : llama-3.3-70b reste
+//    utilisé pour "quick" (rapide, déjà éprouvé), mais gpt-oss-120b (OpenAI, modèle de RAISONNEMENT
+//    en open-weight, toujours gratuit sur Workers AI — vérifié dans le catalogue/tarifs à jour,
+//    aucun changement de palier de facturation) est utilisé pour tous les autres formats — demande
+//    explicite de l'utilisateur pour une profondeur d'analyse que le prompt seul ne pouvait plus
+//    améliorer sur un modèle qui ne raisonne pas en interne. Toujours la même forme d'appel
+//    (messages système+utilisateur), mais la lecture de la réponse est désormais défensive
+//    ({ response } natif OU choices[0].message.content, jamais le raisonnement interne) — voir le
+//    point d'entrée fetch() plus bas pour le détail et les limites connues de ce changement.
 //
 // 2) Envoi des notifications push (scheduled, cron) : lit data/opportunities.json et
 //    data/alerts.json (URL brute GitHub — le site est public, voir CLAUDE.md), envoie une
@@ -383,20 +391,32 @@ function buildSystemPrompt(responseMode, context) {
   return CORE_RULES + format + "Données actuelles du site (analyse-les vraiment avant de répondre) :\n" + context;
 }
 
-// 900 pour les 6 formats longs (market/allocation/comparaison/thèse/portfolio/project ont besoin
-// de vraie place pour plusieurs options/critères/sections structurées, 250 les aurait coupés en
-// plein milieu) contre 320 pour "quick" (relevé de 250 le 09/09/2026, 2e passe : constaté en prod
-// que le modèle dépasse régulièrement les 4-5 phrases demandées malgré la consigne — mieux vaut
-// une marge de sécurité qui laisse terminer la dernière phrase qu'une coupure en plein mot, le
-// vrai problème observé n'était pas la longueur en elle-même mais une réponse tronquée illisible).
-// Palier gratuit
-// Workers AI : ~135 neurones/échange à 250 tokens (voir en tête de fichier) -> environ 3,6x plus
-// long à 900 tokens ne consomme pas 3,6x plus de neurones en pratique (beaucoup de réponses
-// n'utilisent pas tout le budget), mais même dans le pire cas ça laisse largement plus de 20
-// échanges "profonds" gratuits par jour pour un usage personnel — aucun risque réel de dépasser
-// le palier gratuit pour ce projet.
+// 1600 pour les 6 formats longs (market/allocation/comparaison/thèse/portfolio/project — relevé de
+// 900 le 10/09/2026 en même temps que le passage à un modèle de RAISONNEMENT, voir modelForMode
+// ci-dessous : un modèle qui réfléchit avant de répondre consomme une partie du budget de tokens
+// pour ce raisonnement interne, avant même la réponse visible — un budget trop juste risquerait de
+// tronquer la réponse APRÈS le raisonnement mais AVANT qu'elle soit écrite, pire que l'ancien
+// problème de coupure) contre 320 pour "quick" (modèle rapide sans raisonnement, inchangé). Coût
+// réel largement sous le palier gratuit même dans le pire cas — voir le calcul en tête de fichier.
 function maxTokensForMode(responseMode) {
-  return responseMode === "quick" ? 320 : 900;
+  return responseMode === "quick" ? 320 : 1600;
+}
+
+// Modèle par format — changement du 10/09/2026, demande explicite de l'utilisateur ("il doit
+// savoir lire et me répondre tout comme toi avec moi") : gpt-oss-120b (OpenAI, modèle de
+// RAISONNEMENT en open-weight, gratuit sur Workers AI comme llama-3.3-70b jusqu'ici — vérifié dans
+// le catalogue Workers AI, aucun changement de palier de facturation) pour les formats où la
+// PROFONDEUR d'analyse compte le plus. Un modèle de raisonnement réfléchit avant de répondre,
+// cible directement le défaut constaté en prod ("avis pas basé sur l'analyse", captures d'écran
+// utilisateur) bien mieux qu'un réglage de prompt seul sur un modèle qui ne raisonne pas en
+// interne. "quick" reste sur llama-3.3-70b (rapide, déjà éprouvé sur ce format précis, moins
+// d'enjeu de profondeur sur une réponse courte factuelle) — pas de raison de changer ce qui marche
+// déjà là. IMPORTANT, honnêteté sur les limites de ce changement : non vérifié en conditions
+// réelles avant déploiement (impossible d'appeler workers.dev depuis l'environnement de
+// développement) — à confirmer par un vrai test utilisateur après mise en ligne. Revert trivial
+// vers llama-3.3-70b si le résultat réel déçoit (une seule ligne ci-dessous).
+function modelForMode(responseMode) {
+  return responseMode === "quick" ? "@cf/meta/llama-3.3-70b-instruct-fp8-fast" : "@cf/openai/gpt-oss-120b";
 }
 
 // ---- Notifications push (RFC 8291 chiffrement du contenu + RFC 8292 VAPID), WebCrypto pur ----
@@ -715,9 +735,10 @@ export default {
     // 8 dernières actualités, le classement transparent d'allocation depuis le 07/09) plutôt
     // qu'un résumé agrégé, mesuré à ~11 000 caractères en usage réel le 24/08 — 6000 aurait
     // tronqué silencieusement la fin (actualités, alertes récentes) avant même que le modèle les
-    // voie. Le modèle a 24 000 tokens de fenêtre de contexte (~90 000+ caractères) : 20000
-    // caractères de contexte laisse une marge large pour la croissance future sans jamais
-    // s'approcher de la vraie limite du modèle.
+    // voie. Le plus petit des deux modèles (llama-3.3-70b, voir modelForMode) a déjà 24 000 tokens
+    // de fenêtre de contexte (~90 000+ caractères ; gpt-oss-120b va bien au-delà, 128 000 tokens) :
+    // 20000 caractères de contexte laisse une marge large pour la croissance future sans jamais
+    // s'approcher de la vraie limite d'aucun des deux modèles.
     const context = String(body.context || "").slice(0, 20000);
     if (!question) return json({ error: "empty_question" }, 400);
 
@@ -728,14 +749,27 @@ export default {
     const responseMode = RESPONSE_FORMATS[body.responseMode] ? body.responseMode : "quick";
 
     try {
-      const result = await env.AI.run("@cf/meta/llama-3.3-70b-instruct-fp8-fast", {
+      const model = modelForMode(responseMode);
+      const runOptions = {
         messages: [
           { role: "system", content: buildSystemPrompt(responseMode, context || "(aucune donnée fournie ce tour-ci)") },
           { role: "user", content: question },
         ],
         max_tokens: maxTokensForMode(responseMode),
-      });
-      return json({ answer: (result && result.response) || "" }, 200);
+      };
+      // reasoning_effort "low" seulement pour le modèle de raisonnement (gpt-oss-120b, voir
+      // modelForMode) : garde son raisonnement interne compact plutôt que de le laisser consommer
+      // une part imprévisible du budget de tokens avant même d'écrire la réponse visible. Absent
+      // pour llama-3.3-70b (ne raisonne pas en interne, paramètre sans objet pour lui).
+      if (model !== "@cf/meta/llama-3.3-70b-instruct-fp8-fast") runOptions.reasoning_effort = "low";
+
+      const result = await env.AI.run(model, runOptions);
+      // Lecture défensive : { response } est la forme native Workers AI (llama), mais un modèle
+      // de raisonnement peut aussi exposer la forme compatible "chat completions" (choices[0].
+      // message.content) selon la version du binding — jamais choices[0].message.reasoning /
+      // reasoning_content, qui est le raisonnement interne, pas la réponse destinée à l'utilisateur.
+      const answerText = (result && result.response) || (result && result.choices && result.choices[0] && result.choices[0].message && result.choices[0].message.content) || "";
+      return json({ answer: answerText }, 200);
     } catch (e) {
       return json({ error: "ai_error" }, 500);
     }
