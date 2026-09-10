@@ -110,6 +110,25 @@ function json(obj, status) {
 // secours restante est un vrai manque de données (à dire explicitement), jamais une description
 // neutre par défaut.
 //
+// 3e passe le même jour, cette fois à partir de captures d'écran réelles du site en prod
+// (question : "Pourquoi le marché est-il en baisse ?") montrant deux défauts concrets, pas des
+// suppositions : (1) FORMAT_QUICK, plafonné à 250 tokens, se faisait couper en plein mot — le
+// modèle ignorait la consigne "5 phrases max" et débordait largement ; (2) même avec "Mon avis :"
+// ajouté en ouverture (voir passe précédente), l'avis restait générique et déconnecté des faits
+// cités juste après, et le modèle relâchait quand même des tournures interdites ("il est important
+// de noter que...", "il est donc difficile de donner une explication unique et définitive...").
+// Diagnostic : (a) demander la position AVANT les faits poussait le modèle à écrire un avis
+// interchangeable puis à justifier après coup plutôt que de vraiment raisonner ; (b) une liste
+// d'interdits ne suffit pas à elle seule pour un modèle de cette taille (llama-3.3-70b) — une
+// règle positive ("chaque phrase doit apporter un fait ou avancer vers la conclusion") tient mieux
+// que des négations empilées. Correctifs : FORMAT_QUICK inversé (faits d'abord, conclusion
+// ensuite), plafond de tokens "quick" relevé (250 -> 320, marge de sécurité contre la coupure, pas
+// une invitation à rallonger), règle STYLE de CORE_RULES réécrite en positif. Nouveau format
+// "market" (question sur le marché DANS SON ENSEMBLE, ex. "pourquoi le marché baisse ?", "on est
+// en bullrun ?") : ce type de question a plusieurs facteurs à citer (macro + portefeuille + avis)
+// et ne tient pas dans le format "quick" sans se faire couper — voir MARKET_INTENT_RE,
+// js/assistant.js.
+//
 // Ce fichier n'est QUE la source : Cloudflare Workers Builds déploie depuis un dépôt SÉPARÉ
 // (jaki2402-dev/aguilaradar-assistant-ia, voir CLAUDE.md) — un changement ici ne prend effet en
 // ligne qu'une fois reporté là-bas et vérifié (workers_get_worker_code).
@@ -217,11 +236,16 @@ const CORE_RULES =
   "s'il figure explicitement dans les données ci-dessous (ex. thèse hebdo d'un favori) — sinon dis " +
   "que cette donnée n'est pas disponible plutôt que d'estimer un calendrier de déblocage.\n\n" +
 
-  "STYLE, INTERDITS GLOBAUX (tous formats) : direct, naturel, pédagogique, jamais de langue de " +
-  "bois. N'utilise jamais de formulations génériques qui n'apportent rien sans lien avec une " +
-  "analyse concrète : \"il est important de noter que...\", \"le marché crypto est volatil...\", " +
-  "\"les prix peuvent fluctuer...\", ou toute variante qui décrit une évidence générale au lieu " +
-  "d'analyser les données réelles ci-dessous.\n\n" +
+  "STYLE, RÈGLE POSITIVE VALABLE POUR TOUS LES FORMATS : chaque phrase doit soit apporter un " +
+  "chiffre/fait précis tiré des données ci-dessous, soit faire avancer clairement ton raisonnement " +
+  "vers ta conclusion. Si tu n'as plus rien de ce type à ajouter, ARRÊTE ta réponse — ne continue " +
+  "JAMAIS avec une phrase de transition, de mise en garde générale ou de remplissage. Direct, " +
+  "naturel, pédagogique, jamais de langue de bois. Formulations INTERDITES, sous aucune forme, " +
+  "même reformulées ou en fin de réponse pour \"conclure\" : \"il est important de noter que...\", " +
+  "\"le marché crypto est volatil...\", \"les prix peuvent fluctuer...\", \"il est difficile de " +
+  "dire/prédire avec certitude...\", \"il est donc difficile de donner une explication unique et " +
+  "définitive...\", ou toute autre variante qui décrit une évidence générale au lieu d'analyser les " +
+  "données réelles ci-dessous — une phrase qui ne fait que ça n'ajoute rien, ne l'écris pas.\n\n" +
 
   "Règles strictes, non négociables : réponds UNIQUEMENT à partir des données ci-dessous — ne " +
   "complète JAMAIS avec une connaissance générale non vérifiée, ne cite JAMAIS un prix, un " +
@@ -229,20 +253,49 @@ const CORE_RULES =
   "(seule exception, explicitement limitée : le format \"project\" ci-dessous, pour un actif hors " +
   "radar). Réponds en français, avec la précision d'un expert, jamais des généralités vagues.\n\n";
 
+// Ordre INVERSÉ le 09/09/2026 (2e passe) suite à un cas réel observé en prod : l'ancien ordre
+// (position d'abord, faits ensuite) produisait un "Mon avis : ..." générique et interchangeable
+// d'une question à l'autre, suivi de faits qui semblaient plaqués après coup plutôt que d'avoir
+// réellement mené à cette position — exactement le reproche remonté ("il donne son avis mais ne
+// se base pas sur l'analyse"). Faits d'abord, conclusion ensuite : la position doit maintenant se
+// déduire visiblement de ce qui vient d'être posé, jamais l'inverse.
 const FORMAT_QUICK =
-  "FORMAT (question rapide sur un actif ou le marché) — dans cet ordre, 5 phrases maximum au " +
+  "FORMAT (question rapide sur un actif ou le marché) — dans cet ordre, 4 phrases maximum au " +
   "total (jamais plus) :\n" +
-  "1. Une phrase de position claire en ouverture, du point de vue d'un investisseur long terme — " +
-  "pas une simple description de ce qui se passe.\n" +
-  "2. 2 à 3 phrases de justification, CHACUNE ancrée sur un chiffre ou un fait précis tiré des " +
-  "données ci-dessous.\n" +
-  "3. Optionnel, une seule phrase finale de point de vigilance CONCRET (seuil de prix, date, " +
-  "indicateur nommé). Si tu n'en as pas de précis, n'ajoute PAS cette phrase.\n\n" +
-  "INTERDIT, y compris en fin de réponse pour \"conclure\" : \"il est difficile de prédire avec " +
-  "certitude\", \"il faudrait surveiller de près les développements/l'évolution\", \"sans données " +
-  "plus précises\", \"il est encore trop tôt pour dire\", \"pour avoir une vision plus claire\", ou " +
-  "toute autre reformulation de \"je ne sais pas\" qui n'affirme rien de concret. Si tu n'as " +
-  "vraiment rien de plus précis à dire après l'étape 2, ARRÊTE ta réponse là plutôt que de meubler.\n\n";
+  "1 à 2. Les faits/chiffres les PLUS PERTINENTS pour cette question précise tirés des données " +
+  "ci-dessous — choisis parce qu'ils vont mener quelque part, jamais une liste neutre de \"ce qui " +
+  "se passe\".\n" +
+  "3. UNE phrase de conclusion à la première personne, qui doit être la suite logique directe des " +
+  "faits juste cités (\"Mon avis : ...\", \"à ta place, je...\") — jamais une position générique " +
+  "qui aurait pu être écrite avant même de lire les données.\n" +
+  "4. Optionnel, une seule phrase de point de vigilance CONCRET (seuil de prix, date, indicateur " +
+  "nommé) ou de ce qui invaliderait ta conclusion. Si tu n'en as pas de précis, n'ajoute PAS cette " +
+  "phrase.\n\n" +
+  "INTERDIT, y compris en fin de réponse pour \"conclure\" (voir aussi STYLE plus haut) : \"il est " +
+  "difficile de prédire avec certitude\", \"il faudrait surveiller de près les développements/" +
+  "l'évolution\", \"sans données plus précises\", \"il est encore trop tôt pour dire\", \"pour " +
+  "avoir une vision plus claire\", ou toute autre reformulation de \"je ne sais pas\" qui n'affirme " +
+  "rien de concret. Si tu n'as vraiment rien de plus précis à dire, ARRÊTE ta réponse là plutôt " +
+  "que de meubler.\n\n";
+
+const FORMAT_MARKET =
+  "FORMAT (question sur le marché crypto DANS SON ENSEMBLE — \"pourquoi le marché baisse/monte ?\", " +
+  "\"on est en bullrun ?\") : une simple lecture de régime ne suffit pas, structure ta réponse dans " +
+  "cet esprit (adapte au cas réel, 10 phrases maximum au total) :\n" +
+  "1. Ce qui bouge réellement, chiffré si possible (régime, dominance, indice peur/cupidité, ou un " +
+  "mouvement de prix notable cité dans les données).\n" +
+  "2. Le ou les facteurs probablement responsables tirés des données ci-dessous (macro, actualité, " +
+  "flux) — distingue explicitement ce qui est confirmé par les données de ce qui reste une " +
+  "hypothèse plausible mais non confirmée.\n" +
+  "3. Impact sur le portefeuille de l'utilisateur SEULEMENT s'il y en a un dans les données " +
+  "ci-dessous (positions gagnantes/perdantes) — ne force pas ce point s'il n'y a pas de " +
+  "portefeuille fourni.\n" +
+  "4. Ton avis d'investisseur long terme, à la première personne, qui doit être la conclusion des " +
+  "points précédents — jamais une phrase générique sur la volatilité du marché.\n" +
+  "5. Ce qui pourrait changer cet avis (donnée à surveiller, seuil, événement à venir).\n" +
+  "Ne mentionne un facteur macro/géopolitique QUE s'il figure explicitement dans les données " +
+  "ci-dessous — jamais une supposition générale sur \"les tensions géopolitiques\" ou \"la Fed\" " +
+  "sans donnée concrète pour l'appuyer.\n\n";
 
 const FORMAT_ALLOCATION =
   "FORMAT (question d'allocation — \"où placer/renforcer X €\", ou \"quel projet recharger ?\") : " +
@@ -317,6 +370,7 @@ const FORMAT_THESIS =
 
 const RESPONSE_FORMATS = {
   quick: FORMAT_QUICK,
+  market: FORMAT_MARKET,
   allocation: FORMAT_ALLOCATION,
   comparison: FORMAT_COMPARISON,
   thesis: FORMAT_THESIS,
@@ -329,17 +383,20 @@ function buildSystemPrompt(responseMode, context) {
   return CORE_RULES + format + "Données actuelles du site (analyse-les vraiment avant de répondre) :\n" + context;
 }
 
-// 900 pour les 5 formats longs (allocation/comparaison/thèse/portfolio/project ont besoin de
-// vraie place pour plusieurs options/critères/sections structurées, 250 les aurait coupés en
-// plein milieu) contre 250 pour "quick" (inchangé depuis le 31/08 : 5 phrases y tiennent
-// largement). Palier gratuit
+// 900 pour les 6 formats longs (market/allocation/comparaison/thèse/portfolio/project ont besoin
+// de vraie place pour plusieurs options/critères/sections structurées, 250 les aurait coupés en
+// plein milieu) contre 320 pour "quick" (relevé de 250 le 09/09/2026, 2e passe : constaté en prod
+// que le modèle dépasse régulièrement les 4-5 phrases demandées malgré la consigne — mieux vaut
+// une marge de sécurité qui laisse terminer la dernière phrase qu'une coupure en plein mot, le
+// vrai problème observé n'était pas la longueur en elle-même mais une réponse tronquée illisible).
+// Palier gratuit
 // Workers AI : ~135 neurones/échange à 250 tokens (voir en tête de fichier) -> environ 3,6x plus
 // long à 900 tokens ne consomme pas 3,6x plus de neurones en pratique (beaucoup de réponses
 // n'utilisent pas tout le budget), mais même dans le pire cas ça laisse largement plus de 20
 // échanges "profonds" gratuits par jour pour un usage personnel — aucun risque réel de dépasser
 // le palier gratuit pour ce projet.
 function maxTokensForMode(responseMode) {
-  return responseMode === "quick" ? 250 : 900;
+  return responseMode === "quick" ? 320 : 900;
 }
 
 // ---- Notifications push (RFC 8291 chiffrement du contenu + RFC 8292 VAPID), WebCrypto pur ----
